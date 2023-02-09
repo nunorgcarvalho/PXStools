@@ -5,6 +5,7 @@
 
 #' @param df the data frame input
 #' @param X column name of significant exposure variables from XWAS
+#' @param X_groups a vector of the same length as X that contains the group of each exposure in the same order. Actual value for each group is arbitrary. Leave empty if no grouping
 #' @param cov column name of covariates
 #' @param mod type of model to run; 'lm' for linear regression, 'logistic' for logistic regression; 'cox' for Cox regression
 #' @param IDA list of IDs to from XWAS procedure
@@ -29,6 +30,7 @@
 #'
 PXS = function(df,
                X,
+               X_groups = c(),
                cov,
                mod,
                IDA,
@@ -79,44 +81,57 @@ PXS = function(df,
   logger::log_info(paste(nrow(keep),'individuals remain'))
   
   
-  responsetab=function(dff){
-    resptab=c()
-    resptab2=c()
-    nums = data.frame(class = sapply(colnames(dff), function(x)
-      class(dff[[x]])))
-    if (nrow(nums)!=2|ncol(dff)==2) {
-      nums=t(nums)
-      logger::log_warn('transformed responsetab')
-    }
-    
-    cati = colnames(nums)[which(nums[1,] != 'numeric')]
-    if (length(cati)!=0) {
-      resptab = plyr::ldply(dff[which(colnames(dff)%in%cati)], function(x)
-        t(rbind(names(table(
-          x
-        )), table(x))))
-      resptab$varsrespon = paste(resptab[, 1], resptab[, 2], sep = '_')
-      
-      colnames(resptab) = c('Var', 'Response', 'N','VR')
-      resptab$Response=as.character(resptab$Response)
-    }
-    
-    nums= colnames(nums)[which(nums[1,] == 'numeric')]
-    if (length(nums)!=0) {
-      resptab2 = cbind(nums,nrow(dff),nrow(dff),nums)
-      colnames(resptab2) = c('Var', 'Response', 'N','VR')
-    }
-    
-    resptab = rbind(resptab,resptab2)
-    return(resptab)
-  }
-  
+  ##
   Xtemp = keep[, which(colnames(keep) %in% X)]
-  rt=responsetab(Xtemp)
-  nn=which(rt$N==0)
-  if(length(nn)!=0){
-    rt=rt[-which(rt$N==0),]
-  }
+  if (length(X_groups) != length(X)) {X_groups <- 1:length(X)}
+  # make table of exposure + group, as well as minimum N for each exposure
+  # (quantitative: N = # of respondents; binary: N = # minimum of responses for 0 or 1)
+  expo_groups <- data.frame(expo = X, group = X_groups,
+                            min_N = sapply(X, function(expo)
+                              if (length(names(table(Xtemp[expo])))==2) {
+                                min(table(Xtemp[expo]))
+                              } else {length(Xtemp[,expo] %>% na.omit())}
+                            ))
+  ##
+  
+  # responsetab=function(dff){
+  #   resptab=c()
+  #   resptab2=c()
+  #   nums = data.frame(class = sapply(colnames(dff), function(x)
+  #     class(dff[[x]])))
+  #   if (nrow(nums)!=2|ncol(dff)==2) {
+  #     nums=t(nums)
+  #     logger::log_warn('transformed responsetab')
+  #   }
+  # 
+  #   cati = colnames(nums)[which(nums[1,] != 'numeric')]
+  #   if (length(cati)!=0) {
+  #     resptab = plyr::ldply(dff[which(colnames(dff)%in%cati)], function(x)
+  #       t(rbind(names(table(
+  #         x
+  #       )), table(x))))
+  #     resptab$varsrespon = paste(resptab[, 1], resptab[, 2], sep = '_')
+  # 
+  #     colnames(resptab) = c('Var', 'Response', 'N','VR')
+  #     resptab$Response=as.character(resptab$Response)
+  #   }
+  # 
+  #   nums= colnames(nums)[which(nums[1,] == 'numeric')]
+  #   if (length(nums)!=0) {
+  #     resptab2 = cbind(nums,nrow(dff),nrow(dff),nums)
+  #     colnames(resptab2) = c('Var', 'Response', 'N','VR')
+  #   }
+  # 
+  #   resptab = rbind(resptab,resptab2)
+  #   return(resptab)
+  # }
+  # 
+  # Xtemp = keep[, which(colnames(keep) %in% X)]
+  # rt=responsetab(Xtemp)
+  # nn=which(rt$N==0)
+  # if(length(nn)!=0){
+  #   rt=rt[-which(rt$N==0),]
+  # }
   
   ##REGULARIZATION
   ############
@@ -181,9 +196,13 @@ PXS = function(df,
   }
   
   tmp_coeffs <- coef(lasso_best)
-  #save variables with non-zero coeffs
+  #save variables with non-zero coeffs, including all other variables in their groups
   M <- data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], coefficient = tmp_coeffs@x)
-  M <- unique(rt$Var[which(rt$Var %in% M$name)])
+  coeffs_groups <- (M %>% inner_join(expo_groups, by=c("name"="expo")))$group %>% unique()
+  M <- c(M$name[M$name %in% expo_groups$expo],
+         expo_groups[which(expo_groups$group %in% coeffs_groups & !(expo_groups$expo %in% M$name)),"expo"])
+  
+  #M <- unique(rt$Var[which(rt$Var %in% M$name)])
   
   if (length(M) == 0) {
     logger::log_error('no variables remain after regularization')
@@ -238,8 +257,18 @@ PXS = function(df,
       broom::tidy(survival::coxph(survival::Surv(TIME, PHENO) ~ 0 + ., data = B_temp))
   }
   
-  sig = fit$term[which(fit$p.value < 0.05)]
-  sig = unique(rt$Var[which(rt$Var %in% sig)])
+  # saves all exposures part of a group with at least one exposure with p<0.05
+  fit_expos <- fit %>%
+    mutate(estimate = ifelse(is.na(estimate), 0, estimate),
+           statistic = ifelse(is.na(statistic), 0, statistic),
+           p.value = ifelse(is.na(p.value), 1, p.value)) %>%
+    inner_join(expo_groups, by=c("term"="expo")) %>%
+    group_by(group) %>% mutate(group_p.value = min(p.value))
+  sig <- fit_expos[fit_expos$group_p.value < 0.05,"term"][[1]]
+  # sig <- c(fit[which(!(fit$term %in% X) & fit$p.value < 0.05),"term"][[1]],
+  #          fit_expos[fit_expos$group_p.value < 0.05,"term"][[1]])  
+  #sig = fit$term[which(fit$p.value < 0.05)]
+  #sig = unique(rt$Var[which(rt$Var %in% sig)])
   
   logger::log_info(paste(length(sig), 'remain after BackS iteration 1'))
   
@@ -273,8 +302,16 @@ PXS = function(df,
         broom::tidy(survival::coxph(survival::Surv(TIME, PHENO) ~ 0 + ., data = B_temp))
     }
     
-    sig = fit$term[which(fit$p.value < 0.05)]
-    sig = unique(rt$Var[which(rt$Var %in% sig)])
+    
+    fit_expos <- fit %>%
+      mutate(estimate = ifelse(is.na(estimate), 0, estimate),
+             statistic = ifelse(is.na(statistic), 0, statistic),
+             p.value = ifelse(is.na(p.value), 1, p.value)) %>%
+      inner_join(expo_groups, by=c("term"="expo")) %>%
+      group_by(group) %>% mutate(group_p.value = min(p.value))
+    sig <- fit_expos[fit_expos$group_p.value < 0.05,"term"][[1]]
+    #sig = fit$term[which(fit$p.value < 0.05)]
+    #sig = unique(rt$Var[which(rt$Var %in% sig)])
     
     if (length(setdiff(sig, initial)) == 0) {
       logger::log_info(cat(length(sig),"remain after final BackS iteration, they are: ", sig,"\n",sep=" "))
